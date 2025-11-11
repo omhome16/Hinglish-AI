@@ -3,5 +3,5 @@ venv/
 __pycache__/
 venv
 models/
-data/instruction_dataset
+data/blended_dataset/
 .env

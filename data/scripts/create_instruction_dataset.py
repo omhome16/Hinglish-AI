@@ -1,157 +1,222 @@
 import json
-from pathlib import Path
-from typing import List, Dict
+import re
 import random
+from pathlib import Path
 from datasets import load_dataset
+from tqdm import tqdm
+
+# --------------------------------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------------------------------
+
+# This is the Llama-3-style system prompt your model will be trained with.
+SYSTEM_PROMPT = """You are a helpful AI assistant that speaks Hinglish (a natural mix of Hindi and English). You understand code-mixed queries and respond naturally in the same style. Be conversational, friendly, and helpful. If asked to explain code, provide clear, step-by-step explanations in Hinglish."""
+
+# Define the "Golden Ratio" of datasets
+# We will aim for a total of ~250k examples
+DATASET_CONFIGS = [
+    {
+        "name": "Abhishekcr448/Hinglish-Everyday-Conversations-1M",
+        "split": "train",
+        "num_examples": 150000,
+        "normalizer_func": "normalize_abhishek_format",
+        "label": "Vocab (Single-Turn)",
+    },
+    {
+        "name": "manishiitg/aditi-syn-v1",
+        "split": "train",
+        "num_examples": 50000,
+        "normalizer_func": "normalize_aditi_format",
+        "label": "Structure (Multi-Turn)",
+    },
+    {
+        "name": "ai4bharat/indic-instruct-data-v0.1",
+        "config_name": "hi",  # Use the Hindi config
+        "split": "train",
+        "num_examples": 50000,
+        "normalizer_func": "normalize_bharat_format",
+        "label": "Skill (Code & Instructions)",
+    }
+]
+
+# Define output directory and split ratios
+OUTPUT_DIR = "data/blended_dataset"
+VAL_SIZE = 0.05  # 5% for validation
+TEST_SIZE = 0.05  # 5% for test
 
 
-class InstructionDatasetCreator:
-    def __init__(self):
-        self.system_prompt = """You are a helpful AI assistant that speaks Hinglish (a natural mix of Hindi and English). You understand code-mixed queries and respond naturally in the same style. Be conversational, friendly, and helpful."""
+# --------------------------------------------------------------------------
+# NORMALIZATION FUNCTIONS
+# --------------------------------------------------------------------------
 
-    def format_conversation(self, conversation: Dict) -> Dict:
-        """Convert to instruction format"""
-        # Llama-3 chat template format
-        formatted = {
-            "messages": [
-                {
-                    "role": "system",
-                    "content": self.system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": conversation['input']  # <--- FIXED
-                },
-                {
-                    "role": "assistant",
-                    "content": conversation['output']  # <--- FIXED
-                }
-            ],
-            "metadata": conversation.get('metadata', {})
-        }
-        return formatted
-
-    def add_multi_turn_context(self, conversations: List[Dict]) -> List[Dict]:
-        """Create multi-turn conversations from single turns"""
-        multi_turn_data = []
-        scenario_groups = {}
-        for conv in conversations:
-            scenario = conv.get('metadata', {}).get('scenario', 'general')
-            if scenario not in scenario_groups:
-                scenario_groups[scenario] = []
-            scenario_groups[scenario].append(conv)
-
-        for scenario, convs in scenario_groups.items():
-            if len(convs) < 2:
-                continue
-
-            num_to_generate = min(100, len(convs) // 3)
-
-            for _ in range(num_to_generate):
-                num_turns = random.randint(2, 4)
-                sample_size = min(num_turns, len(convs))
-                if sample_size == 0: continue
-
-                selected = random.sample(convs, sample_size)
-                messages = [{"role": "system", "content": self.system_prompt}]
-                for conv in selected:
-                    messages.append({"role": "user", "content": conv['input']})  # <--- FIXED
-                    messages.append({"role": "assistant", "content": conv['output']})  # <--- FIXED
-
-                multi_turn_data.append({
-                    "messages": messages,
-                    "metadata": {"type": "multi_turn", "scenario": scenario}
-                })
-        return multi_turn_data
-
-    # *** MODIFIED FUNCTION ***
-    def create_dataset_splits(self, hf_dataset, output_dir: str, size_suffix: str):
-        """Combine, augment, split, and save datasets with a size suffix"""
-
-        all_conversations = list(hf_dataset)
-        print(f"\nProcessing {len(all_conversations)} source examples for size '{size_suffix}'...")
-
-        # Format for instruction tuning
-        formatted_data = [self.format_conversation(conv) for conv in all_conversations]
-
-        # Add multi-turn conversations
-        multi_turn = self.add_multi_turn_context(all_conversations)
-        formatted_data.extend(multi_turn)
-
-        print(f"Total after adding multi-turn: {len(formatted_data)}")
-
-        # Shuffle
-        random.shuffle(formatted_data)
-
-        # Split: 80% train, 10% validation, 10% test
-        total = len(formatted_data)
-        train_size = int(0.8 * total)
-        val_size = int(0.1 * total)
-
-        train_data = formatted_data[:train_size]
-        val_data = formatted_data[train_size:train_size + val_size]
-        test_data = formatted_data[train_size + val_size:]
-
-        # Save splits
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        for split_name, split_data in [('train', train_data), ('val', val_data), ('test', test_data)]:
-            # Add the size suffix to the filename
-            output_file = output_path / f"{split_name}_{size_suffix}.jsonl"
-            with open(output_file, 'w', encoding='utf-8') as f:
-                for item in split_data:
-                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
-            print(f"✓ Saved {len(split_data)} examples to {output_file}")
-
-        # Print statistics
-        self.print_statistics(train_data, val_data, test_data)
-
-    def print_statistics(self, train_data, val_data, test_data):
-        """Print dataset statistics"""
-        print("\n" + "=" * 60)
-        print("DATASET STATISTICS")
-        print("=" * 60)
-        print(f"\n📊 Split Sizes:")
-        print(f"  Train: {len(train_data)} examples")
-        print(f"  Validation: {len(val_data)} examples")
-        print(f"  Test: {len(test_data)} examples")
-        print(f"  Total: {len(train_data) + len(val_data) + len(test_data)} examples")
-        # (Rest of your statistics print function is fine, removed for brevity)
+def normalize_abhishek_format(example: dict) -> dict:
+    """
+    Converts {'input': '...', 'output': '...'} to Llama-3 chat format.
+    """
+    return {
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": example["input"]},
+            {"role": "assistant", "content": example["output"]},
+        ]
+    }
 
 
-# *** MODIFIED FUNCTION ***
-def main():
-    creator = InstructionDatasetCreator()
-    dataset_name = "Abhishekcr448/Hinglish-Everyday-Conversations-1M"
+def normalize_aditi_format(example: dict) -> dict:
+    """
+    Parses a single string "User: ... \nAssistant: ..." into Llama-3 format.
+    """
+    conversation_str = example["conversation"]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Define the dataset sizes you want to experiment with
-    dataset_sizes = [50000, 150000, 250000]
-    output_directory = 'data/instruction_dataset'
+    # Split the conversation string by "User: " and "Assistant: "
+    # We use a regex lookahead to keep the delimiters
+    turns = re.split(r'(\nUser: |\nAssistant: )', conversation_str)
 
-    for size in dataset_sizes:
-        print(f"\n--- Starting processing for dataset size: {size} ---")
-        size_str = f"{size // 1000}k"  # Creates suffixes like "50k", "150k"
+    # The first element is often empty or just the first user prompt without "User: "
+    if not turns[0].strip():
+        turns = turns[1:]  # Discard empty first element
 
-        try:
-            # Load the specified slice from Hugging Face
-            hf_dataset = load_dataset(dataset_name, split=f"train[:{size}]")
-            print(f"✓ Successfully loaded {len(hf_dataset)} examples from HF.")
+    # Handle the case where the first turn doesn't have a "User: " prefix
+    if not turns[0].startswith("\nUser: ") and not turns[0].startswith("\nAssistant: "):
+        messages.append({"role": "user", "content": turns[0].strip()})
+        turns = turns[1:]  # Move to the next part
 
-            # Create and save the train/val/test splits for this size
-            creator.create_dataset_splits(
-                hf_dataset=hf_dataset,
-                output_dir=output_directory,
-                size_suffix=size_str
-            )
-
-        except Exception as e:
-            print(f"❌ Failed to process size {size}. Error: {e}")
+    # Process the rest of the turns
+    for i in range(0, len(turns), 2):
+        if i + 1 >= len(turns):
             continue
 
-    print("\n✅ All dataset creation complete!")
-    print(f"Check the '{output_directory}' folder for all your .jsonl files.")
+        role_str = turns[i].strip().replace(":", "")
+        content_str = turns[i + 1].strip()
+
+        role = "user" if role_str == "User" else "assistant"
+
+        messages.append({"role": role, "content": content_str})
+
+    # Check if we successfully created a conversation
+    if len(messages) <= 2:  # Should be at least system, user, assistant
+        return None  # Return None to skip this bad example
+
+    return {"messages": messages}
+
+
+def normalize_bharat_format(example: dict) -> dict:
+    """
+    Converts the 'messages' list from ai4bharat format
+    by simply prepending our system prompt.
+    """
+    # The dataset already has a 'messages' column in the right format
+    # We just need to add our system prompt.
+    existing_messages = example["messages"]
+
+    # Ensure it's a valid list of dicts
+    if not isinstance(existing_messages, list) or not existing_messages:
+        return None
+
+    return {
+        "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT}
+                    ] + existing_messages
+    }
+
+
+# --------------------------------------------------------------------------
+# MAIN SCRIPT
+# --------------------------------------------------------------------------
+
+def create_blended_dataset():
+    """
+    Main function to load, normalize, blend, and save the datasets.
+    """
+    print("Starting blended dataset creation...")
+
+    all_data = []
+    normalizers = {
+        "normalize_abhishek_format": normalize_abhishek_format,
+        "normalize_aditi_format": normalize_aditi_format,
+        "normalize_bharat_format": normalize_bharat_format,
+    }
+
+    for config in DATASET_CONFIGS:
+        print(f"\n--- Loading: {config['name']} ({config['label']}) ---")
+        print(f"Requesting {config['num_examples']} examples...")
+
+        try:
+            # Load with streaming=True to avoid downloading huge files
+            dataset = load_dataset(
+                config['name'],
+                name=config.get('config_name'),  # Use config_name if it exists
+                split=config['split'],
+                streaming=True
+            )
+
+            # Take the number of examples we want
+            dataset_slice = dataset.take(config['num_examples'])
+
+            # Get the correct normalization function
+            normalizer_func = normalizers[config['normalizer_func']]
+
+            processed_count = 0
+            skipped_count = 0
+
+            # Use tqdm for a progress bar
+            for example in tqdm(dataset_slice, total=config['num_examples']):
+                normalized_example = normalizer_func(example)
+
+                if normalized_example and len(normalized_example['messages']) > 1:
+                    all_data.append(normalized_example)
+                    processed_count += 1
+                else:
+                    skipped_count += 1
+
+            print(f"✓ Processed: {processed_count} examples")
+            if skipped_count > 0:
+                print(f"⚠️ Skipped: {skipped_count} bad/empty examples")
+
+        except Exception as e:
+            print(f"❌ FAILED to load {config['name']}. Error: {e}")
+            print("Skipping this dataset...")
+
+    print("\n--- Blending and Shuffling ---")
+    print(f"Total examples from all sources: {len(all_data)}")
+    random.shuffle(all_data)
+    print("✓ Data shuffled successfully.")
+
+    # --- Splitting Data ---
+    total_size = len(all_data)
+    test_split_index = int(total_size * (1 - TEST_SIZE))
+    val_split_index = int(test_split_index * (1 - VAL_SIZE / (1 - TEST_SIZE)))
+
+    train_data = all_data[:val_split_index]
+    val_data = all_data[val_split_index:test_split_index]
+    test_data = all_data[test_split_index:]
+
+    print("\n--- Saving Splits ---")
+    output_path = Path(OUTPUT_DIR)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    splits = {
+        "train": train_data,
+        "val": val_data,
+        "test": test_data,
+    }
+
+    for split_name, data in splits.items():
+        output_file = output_path / f"{split_name}.jsonl"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for item in data:
+                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+        print(f"✓ Saved {len(data)} examples to {output_file}")
+
+    print("\n" + "=" * 50)
+    print("✅ BLENDED DATASET CREATION COMPLETE!")
+    print(f"Total: {len(all_data)}")
+    print(f"Train: {len(train_data)}")
+    print(f"Val:   {len(val_data)}")
+    print(f"Test:  {len(test_data)}")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
-    main()
+    create_blended_dataset()

@@ -1,109 +1,124 @@
 #!/usr/bin/env python3
+"""
+QLoRA Fine-Tuning Script for Llama 3.2-3B-Instruct on Hinglish Dataset (v2.0 - Optimized for 3090).
+Supports multi-turn chat formatting, existing splits, and 5-7 hr runtime.
+
+Usage: nohup python finetune_qlora.py --r 8 --alpha 16 --output_dir ./r8-checkpoints --dataset "omhome/hinglish-blended-dataset" --repo "omhome/hinglish-llama-r8" > r8_log.out 2>&1 &
+"""
+
 import argparse
-import os
 import logging
+import math
+import os
+from pathlib import Path
+
 import torch
-from datasets import load_dataset, DatasetDict
+from datasets import DatasetDict, load_dataset
+from peft import LoraConfig
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
     TrainingArguments,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer
 
-# --- Configuration ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a helpful AI assistant that speaks Hinglish (a natural mix of Hindi and English). You understand code-mixed queries and respond naturally in the same style. Be conversational, friendly, and helpful. If asked to explain code, provide clear, step-by-step explanations in Hinglish."""
+
+def formatting_prompts_func(example, tokenizer):
+    """Convert {'messages': [...]} to formatted text using Llama 3.2 chat template."""
+    messages = example["messages"]
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )
+    return {"text": text}
 
 
-def train_model(lora_r, lora_alpha, output_dir, hf_dataset_name, hf_model_repo_name):
+def train_model(lora_r: int, lora_alpha: int, output_dir: str, hf_dataset_name: str, hf_model_repo_name: str, resume_from_checkpoint: str = None):
     """
-    Main function to load data, configure, run training, and upload to Hub.
+    Main training loop: Load model/tokenizer, dataset, format chats, configure PEFT/Trainer, train, save, and upload.
     """
-    logger.info(f"--- Starting training for r={lora_r}, alpha={lora_alpha} ---")
-    logger.info(f"Dataset: {hf_dataset_name}")
-    logger.info(f"Target Repo: {hf_model_repo_name}")
+    logger.info(f"--- Starting QLoRA fine-tuning: r={lora_r}, alpha={lora_alpha} ---")
+    logger.info(f"Dataset: {hf_dataset_name} | Output: {output_dir} | Target Repo: {hf_model_repo_name}")
+    logger.info(f"Resume from: {resume_from_checkpoint or 'None (fresh start)'}")
 
-    # --- 1. Load Model & Tokenizer ---
-    model_name = "meta-llama/Llama-3.2-3b-instruct"
+    model_name = "meta-llama/Meta-Llama-3.2-3B-Instruct"
+    max_seq_length = 2048  # Suitable for Hinglish chats; adjust if needed
 
-    # 4-bit config (stable for RTX 3090)
+    # --- Quantization Config (4-bit NF4 for 3090) ---
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,  # Use float16 for stability
-        bnb_4bit_use_double_quant=True,  # Enable for memory efficiency
+        bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        bnb_4bit_use_double_quant=False,
     )
 
-    logger.info(f"Loading base model: {model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-    )
+    # --- Load Model ---
+    try:
+        logger.info(f"Loading {model_name} with 4-bit quant...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+            attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
+        )
+        model.config.use_cache = False
+        logger.info("Model loaded successfully.")
+    except Exception as e:
+        logger.error("Model load failed. Check HF token/CUDA.")
+        raise
 
-    # Prepare model for k-bit training
-    model = prepare_model_for_kbit_training(model)
-    model.config.use_cache = False
-    logger.info("Model loaded and prepared for training.")
+    # --- Load Tokenizer ---
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+        logger.info("Tokenizer loaded.")
+    except Exception as e:
+        logger.error("Tokenizer load failed.")
+        raise
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-    logger.info("Tokenizer loaded.")
-
-    # --- 2. Load and Prepare Dataset ---
-    logger.info(f"Loading dataset from {hf_dataset_name}...")
+    # --- Load Dataset (Use existing train/val splits) ---
     try:
         dataset = load_dataset(hf_dataset_name)
+        if not isinstance(dataset, DatasetDict):
+            dataset = DatasetDict({"train": dataset})
     except Exception as e:
-        logger.error(f"FATAL: Could not load dataset. Error: {e}")
-        return
+        logger.error(f"Dataset load failed: {e}. Ensure public/access.")
+        raise
 
-    if "validation" not in dataset:
-        logger.warning("No 'validation' split found. Creating 5% validation split.")
-        train_val_split = dataset["train"].train_test_split(test_size=0.05, seed=42)
-        dataset = DatasetDict({
-            "train": train_val_split["train"],
-            "validation": train_val_split["test"]
-        })
+    if "train" not in dataset or "validation" not in dataset:
+        raise ValueError("Dataset must have 'train' and 'validation' splits.")
 
-    logger.info(f"Train set: {len(dataset['train'])} examples")
-    logger.info(f"Val set: {len(dataset['validation'])} examples")
+    logger.info(f"Train: {len(dataset['train'])} examples | Val: {len(dataset['validation'])} examples")
 
-    # --- 3. Configure LoRA ---
+    # --- LoRA Config ---
     peft_config = LoraConfig(
-        lora_alpha=lora_alpha,
-        lora_dropout=0.1,
         r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
 
-    # --- 4. Configure Training Arguments ---
-    training_arguments = TrainingArguments(
+    # --- Training Args (Optimized for ~5-7 hrs on 3090: Effective batch=64) ---
+    training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=1,
-        per_device_train_batch_size=2,  # Conservative for stability
+        per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
-        gradient_accumulation_steps=4,  # Effective batch size = 8
-        optim="paged_adamw_32bit",
-        logging_steps=25,
+        gradient_accumulation_steps=32,  # Effective batch=64; ~2,100 steps for 135k
+        optim="paged_adamw_8bit",
+        logging_steps=50,
         learning_rate=2e-4,
         weight_decay=0.001,
-        fp16=True,  # Use fp16 for stability
-        bf16=False,
+        bf16=torch.cuda.is_bf16_supported(),
         max_grad_norm=0.3,
         max_steps=-1,
         warmup_ratio=0.03,
@@ -113,80 +128,69 @@ def train_model(lora_r, lora_alpha, output_dir, hf_dataset_name, hf_model_repo_n
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         report_to="tensorboard",
-        evaluation_strategy="steps",  # Use old parameter name
+        eval_strategy="steps",
         save_strategy="steps",
-        eval_steps=100,
-        save_steps=100,
-        save_total_limit=3,  # Keep only 3 checkpoints
+        eval_steps=500,  # ~4 evals total to save time
+        save_steps=500,
+        gradient_checkpointing=True,
+        dataloader_drop_last=True,
+        remove_unused_columns=False,
+        resume_from_checkpoint=resume_from_checkpoint,
+        push_to_hub=False,  # Handle manually
+        dataloader_num_workers=4,  # Speed up loading
     )
 
-    # --- 5. Initialize Trainer ---
+    # --- SFT Trainer with Chat Formatting ---
     trainer = SFTTrainer(
         model=model,
         train_dataset=dataset["train"],
         eval_dataset=dataset["validation"],
         peft_config=peft_config,
+        formatting_func=lambda ex: formatting_prompts_func(ex, tokenizer),  # Applies chat template
+        max_seq_length=max_seq_length,
         tokenizer=tokenizer,
-        args=training_arguments,
-        max_seq_length=1024,  # Reasonable sequence length
-        packing=False,  # Disable for stability
+        args=training_args,
+        packing=True,  # Packs short seqs for efficiency
     )
 
-    # --- 6. Start Training ---
-    logger.info("Checking for existing checkpoints...")
-
-    resume_from_checkpoint = None
-    if os.path.isdir(output_dir) and len(os.listdir(output_dir)) > 0:
-        checkpoints = [d for d in os.listdir(output_dir) if d.startswith("checkpoint")]
-        if checkpoints:
-            # Get the latest checkpoint
-            latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("-")[1]))
-            resume_from_checkpoint = os.path.join(output_dir, latest_checkpoint)
-            logger.info(f"Resuming from checkpoint: {resume_from_checkpoint}")
-        else:
-            logger.info("No checkpoint found. Starting fresh.")
-    else:
-        logger.info("Starting training from scratch.")
-
-    logger.info("--- Starting Fine-Tuning ---")
+    # --- Train ---
+    logger.info("--- Starting training ---")
     try:
         trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-        logger.info("--- Fine-Tuning Complete ---")
+        logger.info("--- Training complete ---")
     except Exception as e:
-        logger.error(f"Training failed: {e}")
+        logger.error("Training failed.")
         raise
 
-    # --- 7. Save & Upload ---
-    final_model_path = os.path.join(output_dir, "final_model")
-    trainer.save_model(final_model_path)
-    logger.info(f"Model saved to {final_model_path}")
-
+    # --- Save Locally ---
+    final_path = Path(output_dir) / "final_model"
     try:
-        logger.info(f"Uploading to Hub: {hf_model_repo_name}")
-        trainer.model.push_to_hub(
+        trainer.save_model(str(final_path))
+        tokenizer.save_pretrained(final_path)
+        logger.info(f"Model saved to {final_path}")
+    except Exception as e:
+        logger.error(f"Save failed: {e}")
+
+    # --- Upload to HF Hub (Assumes HF_TOKEN set) ---
+    try:
+        logger.info(f"Uploading to {hf_model_repo_name}...")
+        trainer.push_to_hub(
+            commit_message=f"QLoRA r={lora_r} alpha={lora_alpha} on Hinglish dataset",
             repo_id=hf_model_repo_name,
-            commit_message=f"LoRA r={lora_r} alpha={lora_alpha}"
-        )
-        tokenizer.push_to_hub(
-            repo_id=hf_model_repo_name,
-            commit_message=f"LoRA r={lora_r} alpha={lora_alpha}"
         )
         logger.info("Upload complete!")
     except Exception as e:
-        logger.error(f"Upload failed. Is HF_TOKEN set? Error: {e}")
+        logger.error(f"Upload failed: {e}. Check HF_TOKEN.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="QLoRA Fine-Tuning Script")
-    parser.add_argument("--r", type=int, required=True, help="LoRA rank")
-    parser.add_argument("--alpha", type=int, required=True, help="LoRA alpha")
-    parser.add_argument("--output_dir", type=str, required=True,
-                        help="Directory for checkpoints")
-    parser.add_argument("--dataset", type=str, required=True,
-                        help="HF dataset name")
-    parser.add_argument("--repo", type=str, required=True,
-                        help="HF model repo name")
-
+    parser = argparse.ArgumentParser(description="QLoRA Fine-Tuning for Hinglish Llama 3.2-3B")
+    parser.add_argument("--r", type=int, required=True, help="LoRA rank (e.g., 8)")
+    parser.add_argument("--alpha", type=int, required=True, help="LoRA alpha (e.g., 16)")
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
+    parser.add_argument("--dataset", type=str, required=True, help="HF dataset (e.g., 'omhome/hinglish-blended-dataset')")
+    parser.add_argument("--repo", type=str, required=True, help="HF repo to upload")
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to resume checkpoint")
     args = parser.parse_args()
 
     train_model(
@@ -194,5 +198,6 @@ if __name__ == "__main__":
         lora_alpha=args.alpha,
         output_dir=args.output_dir,
         hf_dataset_name=args.dataset,
-        hf_model_repo_name=args.repo
+        hf_model_repo_name=args.repo,
+        resume_from_checkpoint=args.resume_from,
     )

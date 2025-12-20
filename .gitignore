@@ -1,7 +1,74 @@
+# Python
 venv/
+env/
 *.pyc
 __pycache__/
-venv
-models/
-data/blended_dataset/
+*.egg-info/
+dist/
+build/
+.Python
+*.py[cod]
+*$py.class
+
+# Environment variables (SENSITIVE - contains API keys)
 .env
+.env.*
+.env.local
+.env.production
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-*
+
+# Model files (too large for git - ~2GB)
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+
+# Credentials (SENSITIVE - API keys and service accounts)
+google_key.json
+*_key.json
+*.pem
+*.key
+credentials.json
+service_account.json
+hinglish-voice-app/google_key.json
+
+# Data (can be regenerated or downloaded from HuggingFace)
+data/blended_dataset/
+
+# Virtual environments (in any subdirectory)
+**/venv/
+**/env/
+hinglish-voice-app/env/
+
+# Temporary files
+*.log
+temp_*.webm
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node (if any)
+node_modules/
+package-lock.json
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Training outputs
+checkpoints/
+outputs/
+runs/
+wandb/
+tensorboard/
